@@ -1,0 +1,10 @@
+bin/
+obj/
+venv/
+dist/
+build/
+__pycache__/
+
+.vs/
+*.user
+*.suo

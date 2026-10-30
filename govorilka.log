@@ -1,0 +1,24 @@
+
+[2026-10-30 02:23:31] load xtts
+Traceback (most recent call last):
+  File "D:\edu\govorilka\tts_gui.py", line 416, in _get_engine
+    self._status(f"XTTS-v2 загружен, занято видеопамяти: {eng.vram_mb:.0f} МБ.")
+                                                          ^^^^^^^^^^^
+AttributeError: 'XTTSEngine' object has no attribute 'vram_mb'
+
+
+[2026-10-30 02:24:38] load xtts
+Traceback (most recent call last):
+  File "D:\edu\govorilka\tts_gui.py", line 416, in _get_engine
+    self._status(f"XTTS-v2 загружен, занято видеопамяти: {eng.vram_mb:.0f} МБ.")
+                                                          ^^^^^^^^^^^
+AttributeError: 'XTTSEngine' object has no attribute 'vram_mb'
+
+
+[2026-10-30 02:31:42] load xtts
+Traceback (most recent call last):
+  File "D:\edu\govorilka\tts_gui.py", line 416, in _get_engine
+    self._status(f"XTTS-v2 загружен, занято видеопамяти: {eng.vram_mb:.0f} МБ.")
+                                                          ^^^^^^^^^^^
+AttributeError: 'XTTSEngine' object has no attribute 'vram_mb'
+
