@@ -44,9 +44,28 @@ import sounddevice as sd
 # Подготовка текста
 # ----------------------------------------------------------------------------
 SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
+_RE_CYR = re.compile(r"[А-Яа-яЁё]")
+_RE_LAT = re.compile(r"[A-Za-z]")
 
+
+def detect_lang(text: str) -> str:
+    """'en', если латинских букв больше, чем кириллических; иначе 'ru'."""
+    return "en" if len(_RE_LAT.findall(text)) > len(_RE_CYR.findall(text)) else "ru"
 
 def normalize(text: str) -> str:
+    """Числа -> слова на языке своего предложения (только именительный падеж)."""
+    try:
+        from num2words import num2words
+    except ImportError:
+        return text
+    parts = re.split(r"(?<=[.!?…])(\s+)", text)  # предложения вместе с разделителями
+    out = []
+    for part in parts:
+        lang = detect_lang(part)
+        out.append(re.sub(r"\d+", lambda m: num2words(int(m.group()), lang=lang), part))
+    return "".join(out)
+
+def _normalize(text: str) -> str:
     """Числа -> слова (только именительный падеж, без согласования)."""
     try:
         from num2words import num2words
@@ -78,14 +97,16 @@ def split_text(text: str, max_len: int = 180, min_len: int = 40) -> list[str]:
     merged: list[str] = []
     buf = ""
     for p in parts:
-        if buf and len(buf) < min_len and len(buf) + 1 + len(p) <= max_len:
+        if (buf and len(buf) < min_len and len(buf) + 1 + len(p) <= max_len
+                and detect_lang(buf) == detect_lang(p)):
             buf += " " + p
         else:
             if buf:
                 merged.append(buf)
             buf = p
     if buf:
-        if merged and len(buf) < min_len and len(merged[-1]) + 1 + len(buf) <= max_len:
+        if (merged and len(buf) < min_len and len(merged[-1]) + 1 + len(buf) <= max_len
+                and detect_lang(merged[-1]) == detect_lang(buf)):
             merged[-1] += " " + buf
         else:
             merged.append(buf)
@@ -135,9 +156,10 @@ class XTTSEngine:
         self.voice_key = speaker_wav
 
     def synth(self, text: str):
+        lang = detect_lang(text)
         with self.torch.inference_mode():
             for chunk in self.model.inference_stream(
-                text, "ru", self.lat, self.emb,
+                text, lang, self.lat, self.emb,
                 stream_chunk_size=20,
                 temperature=0.65,
                 speed=self.speed,
