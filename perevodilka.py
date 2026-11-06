@@ -94,7 +94,7 @@ class App:
         root.columnconfigure((0, 1), weight=1)
         root.rowconfigure(0, weight=1)
 
-        self.texts, self.buttons = {}, {}
+        self.texts, self.buttons, self.tbuttons = {}, {}, {}
         for col, (code, title, btn) in enumerate(
             [("ru", "Русский", "🎤 Запись (Русский)"), ("en", "English", "🎤 Record (English)")]
         ):
@@ -102,12 +102,19 @@ class App:
             frame.grid(row=0, column=col, sticky="nsew", padx=8, pady=8)
             frame.columnconfigure(0, weight=1)
             frame.rowconfigure(0, weight=1)
-            t = tk.Text(frame, wrap="word", font=("Segoe UI", 13), height=10)
+            t = tk.Text(frame, wrap="word", font=("Segoe UI", 13), height=10, undo=True)
             t.grid(row=0, column=0, sticky="nsew")
-            b = ttk.Button(frame, text=btn, command=lambda c=code: self.toggle(c))
-            b.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            self.enable_clipboard(t)
+            row = ttk.Frame(frame)
+            row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            row.columnconfigure((0, 1), weight=1)
+            b = ttk.Button(row, text=btn, command=lambda c=code: self.toggle(c))
+            b.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            tb = ttk.Button(row, text="Перевести", command=lambda c=code: self.translate_text(c))
+            tb.grid(row=0, column=1, sticky="ew", padx=(4, 0))
             b.state(["disabled"])
-            self.texts[code], self.buttons[code] = t, b
+            tb.state(["disabled"])
+            self.texts[code], self.buttons[code], self.tbuttons[code] = t, b, tb
 
         self.status = tk.StringVar(value="Запуск…")
         ttk.Label(root, textvariable=self.status).grid(
@@ -137,7 +144,7 @@ class App:
 
     def set_buttons(self, enabled):
         def f():
-            for b in self.buttons.values():
+            for b in list(self.buttons.values()) + list(self.tbuttons.values()):
                 b.state(["!disabled"] if enabled else ["disabled"])
         self.ui(f)
 
@@ -147,6 +154,51 @@ class App:
             self.set_buttons(True)
         except Exception as e:
             self.set_status(f"Ошибка загрузки моделей: {e}")
+
+    # ---------- буфер обмена (работает в любой раскладке) ----------
+    def enable_clipboard(self, w):
+        # Привязка по коду клавиши, а не по букве: Ctrl+C/V/X/A/Z работают и в русской раскладке
+        def on_key(e):
+            actions = {67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>", 90: "<<Undo>>"}
+            if e.keycode == 65:  # A
+                w.tag_add("sel", "1.0", "end-1c")
+                return "break"
+            if e.keycode in actions:
+                w.event_generate(actions[e.keycode])
+                return "break"
+
+        w.bind("<Control-KeyPress>", on_key)
+
+        menu = tk.Menu(w, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: w.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda: w.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: w.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: w.tag_add("sel", "1.0", "end-1c"))
+        w.bind("<Button-3>", lambda e: (w.focus_set(), menu.tk_popup(e.x_root, e.y_root)))
+
+    # ---------- перевод готового текста ----------
+    def translate_text(self, src):
+        text = self.texts[src].get("1.0", "end").strip()
+        if not text:
+            self.status.set("Поле пустое: вставьте или введите текст.")
+            return
+        self.set_buttons(False)
+        threading.Thread(target=self.translate_pipeline, args=(src, text), daemon=True).start()
+
+    def translate_pipeline(self, src, text):
+        dst = "en" if src == "ru" else "ru"
+        try:
+            self.set_status("Перевожу…")
+            translated = self.engine.translate(text, src, dst)
+            self.set_text(dst, translated)
+            self.set_status("Озвучиваю перевод…")
+            self.engine.speak(translated, dst)
+            self.set_status("Готово.")
+        except Exception as e:
+            self.set_status(f"Ошибка: {e}")
+        finally:
+            self.set_buttons(True)
 
     # ---------- запись ----------
     def toggle(self, code):
@@ -160,6 +212,8 @@ class App:
         self.frames = []
         other = "en" if code == "ru" else "ru"
         self.buttons[other].state(["disabled"])
+        for tb in self.tbuttons.values():
+            tb.state(["disabled"])
         self.buttons[code].config(text="⏹ Стоп")
         self.status.set("Слушаю… нажмите «Стоп», когда закончите.")
 
