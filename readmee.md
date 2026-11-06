@@ -34,3 +34,6 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 сделать exe файл
 pip install pyinstaller
 pyinstaller --noconfirm --onedir --windowed --name Govorilka --collect-all TTS --collect-all trainer --collect-all gruut --collect-all num2words --collect-all sounddevice  tts_gui.py
+
+pyinstaller --noconfirm --onedir --windowed --name Translator translator.py
+
