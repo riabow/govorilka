@@ -91,6 +91,54 @@ def split_chunks(text, limit):
     return [c for c in chunks if has_words(c)]
 
 
+class Player:
+    """Проигрыватель с паузой, остановкой и перемоткой (на базе sounddevice)."""
+
+    def __init__(self):
+        self.data = np.zeros(1, dtype="float32")
+        self.pos = 0
+        self.sr = TTS_SR
+        self.paused = False
+        self.stop_flag = False
+
+    def load(self, audio, sr):
+        self.data = np.asarray(audio, dtype="float32")
+        self.sr = sr
+        self.pos = 0
+        self.paused = False
+        self.stop_flag = False
+
+    def run(self):
+        """Блокирует поток, пока звук не доиграет или не будет остановлен."""
+        done = threading.Event()
+
+        def cb(outdata, frames, time_info, status):
+            if self.stop_flag:
+                outdata.fill(0)
+                raise sd.CallbackStop
+            if self.paused:
+                outdata.fill(0)
+                return
+            end = min(self.pos + frames, len(self.data))
+            n = end - self.pos
+            if n > 0:
+                outdata[:n, 0] = self.data[self.pos:end]
+            if n < frames:
+                outdata[max(n, 0):] = 0
+            self.pos = end
+            if end >= len(self.data):
+                raise sd.CallbackStop
+
+        with sd.OutputStream(samplerate=self.sr, channels=1, dtype="float32",
+                             callback=cb, finished_callback=done.set):
+            done.wait()
+
+
+def fmt_time(sec):
+    sec = int(sec)
+    return f"{sec // 60:02d}:{sec % 60:02d}"
+
+
 class Engine:
     """Загружает все модели и делает STT / перевод / озвучку."""
 
@@ -169,25 +217,30 @@ class Engine:
                 return None
             return self.tts[lang].apply_tts(text=strict, speaker=cfg["speaker"], sample_rate=TTS_SR)
 
-    def speak(self, text, lang):
+    def synthesize(self, text, lang, progress, cancel):
+        """Генерирует звук по частям; progress(0..1) и cancel (Event) — для интерфейса."""
         chunks = split_chunks(clean_text(text), 250)
+        if not chunks:
+            raise ValueError("В тексте нет слов для озвучки.")
         pieces = []
         pause = torch.zeros(int(TTS_SR * 0.15))
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks, start=1):
+            if cancel.is_set():
+                return None
             audio = self._tts_chunk(chunk, lang)
             if audio is not None:
                 pieces.extend([audio, pause])
+            progress(i / len(chunks))
         if not pieces:
             raise ValueError("В тексте нет слов для озвучки.")
-        sd.play(torch.cat(pieces).numpy(), TTS_SR)
-        sd.wait()
+        return torch.cat(pieces).numpy()
 
 
 class App:
     def __init__(self, root):
         self.root = root
         root.title("Голосовой переводчик RU ↔ EN")
-        root.geometry("900x420")
+        root.geometry("900x470")
         root.columnconfigure((0, 1), weight=1)
         root.rowconfigure(0, weight=1)
 
@@ -227,6 +280,26 @@ class App:
         ttk.Label(bar, textvariable=self.pct_var).grid(row=0, column=2, sticky="e")
         self.progress = ttk.Progressbar(root, mode="determinate", maximum=100)
         self.progress.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+
+        # панель проигрывателя (видна только во время озвучки)
+        self.pframe = ttk.Frame(root)
+        self.pframe.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+        self.pframe.columnconfigure(2, weight=1)
+        self.pause_btn = ttk.Button(self.pframe, text="⏸ Пауза", width=14, command=self.toggle_pause)
+        self.pause_btn.grid(row=0, column=0, padx=(0, 6))
+        self.stop_btn = ttk.Button(self.pframe, text="⏹ Стоп", width=10, command=self.stop_speech)
+        self.stop_btn.grid(row=0, column=1, padx=(0, 10))
+        self.play_bar = ttk.Progressbar(self.pframe, mode="determinate", maximum=100)
+        self.play_bar.grid(row=0, column=2, sticky="ew")
+        self.play_bar.bind("<Button-1>", self.seek)   # клик по полосе — перемотка
+        self.time_var = tk.StringVar(value="")
+        ttk.Label(self.pframe, textvariable=self.time_var, width=22, anchor="e").grid(
+            row=0, column=3, padx=(10, 0))
+        self.pframe.grid_remove()
+        self.player = Player()
+        self.play_state = "idle"          # idle / synth / play
+        self.synth_frac = 0.0
+        self.cancel = threading.Event()
 
         # состояние загрузки / занятости
         self.loading = True
@@ -274,10 +347,69 @@ class App:
             self.p_next = end
         self.ui(f)
 
+    # ---------- озвучка с прогрессом, паузой и остановкой ----------
+    def speak(self, text, lang):
+        """Вызывается из рабочего потока: готовит звук, затем проигрывает."""
+        self.cancel = threading.Event()
+        self.synth_frac = 0.0
+        self.ui(self._player_show)
+        try:
+            audio = self.engine.synthesize(
+                text, lang, lambda f: setattr(self, "synth_frac", f), self.cancel
+            )
+            if audio is None or self.cancel.is_set():
+                return
+            self.player.load(audio, TTS_SR)
+            self.ui(self._enter_play)
+            self.player.run()
+        finally:
+            self.ui(self._player_hide)
+
+    def _player_show(self):
+        self.play_state = "synth"
+        self.pause_btn.config(text="⏸ Пауза")
+        self.pause_btn.state(["disabled"])
+        self.stop_btn.state(["!disabled"])
+        self.pframe.grid()
+
+    def _enter_play(self):
+        self.play_state = "play"
+        self.pause_btn.config(text="⏸ Пауза")
+        self.pause_btn.state(["!disabled"])
+
+    def _player_hide(self):
+        self.play_state = "idle"
+        self.pframe.grid_remove()
+
+    def toggle_pause(self):
+        if self.play_state != "play":
+            return
+        self.player.paused = not self.player.paused
+        self.pause_btn.config(text="▶ Продолжить" if self.player.paused else "⏸ Пауза")
+
+    def stop_speech(self):
+        self.cancel.set()
+        self.player.stop_flag = True
+
+    def seek(self, event):
+        if self.play_state != "play":
+            return
+        width = max(self.play_bar.winfo_width(), 1)
+        frac = min(max(event.x / width, 0.0), 1.0)
+        self.player.pos = int(frac * (len(self.player.data) - 1))
+
     def tick(self):
         """Крутилка и плавное движение полосы загрузки."""
         self.spin_lbl.config(text=SPINNER[self.spin_i % len(SPINNER)] if self.busy else "")
         self.spin_i += 1
+        if self.play_state == "synth":
+            self.play_bar["value"] = self.synth_frac * 100
+            self.time_var.set(f"Подготовка звука… {int(self.synth_frac * 100)}%")
+        elif self.play_state == "play":
+            total, pos = len(self.player.data), self.player.pos
+            self.play_bar["value"] = pos / max(total, 1) * 100
+            sr = self.player.sr
+            self.time_var.set(f"{fmt_time(pos / sr)} / {fmt_time(total / sr)}")
         if self.loading:
             cap = self.p_next - 1 if self.p_next < 100 else 100
             if self.p_shown < cap:
@@ -346,7 +478,7 @@ class App:
             translated = self.engine.translate(text, src, dst)
             self.set_text(dst, translated)
             self.set_status("Озвучиваю перевод…")
-            self.engine.speak(translated, dst)
+            self.speak(translated, dst)
             self.set_status("Готово.")
         except Exception as e:
             self.set_status(f"Ошибка: {e}")
@@ -365,7 +497,7 @@ class App:
     def speak_pipeline(self, code, text):
         try:
             self.set_status("Озвучиваю…")
-            self.engine.speak(text, code)
+            self.speak(text, code)
             self.set_status("Готово.")
         except Exception as e:
             self.set_status(f"Ошибка: {e}")
@@ -429,7 +561,7 @@ class App:
             self.set_text(dst, translated)
 
             self.set_status("Озвучиваю перевод…")
-            self.engine.speak(translated, dst)
+            self.speak(translated, dst)
             self.set_status("Готово.")
         except Exception as e:
             self.set_status(f"Ошибка: {e}")
