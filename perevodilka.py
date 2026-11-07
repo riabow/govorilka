@@ -7,7 +7,9 @@ STT (речь -> текст):  Whisper (openai/whisper-medium, можно small)
 
 Модели скачиваются автоматически при первом запуске и дальше лежат на диске.
 """
+import re
 import threading
+import unicodedata
 import tkinter as tk
 from tkinter import ttk
 
@@ -23,10 +25,70 @@ TTS_SR = 48000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 LANGS = {
     "ru": {"name": "russian", "tts_lang": "ru", "tts_model": "v4_ru", "speaker": "xenia"},
     "en": {"name": "english", "tts_lang": "en", "tts_model": "v3_en", "speaker": "en_0"},
 }
+
+
+# ---------------- очистка текста ----------------
+_BAD_CATS = {"So", "Sk", "Cs", "Co", "Cn", "Cf", "Cc", "Me"}
+
+
+def clean_text(text):
+    """Убирает эмодзи, значки (🔊 ✓ ★ →…), невидимые символы и мусор, которые ломают модели."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("™", "").replace("®", "").replace("©", "")
+    text = unicodedata.normalize("NFKC", text)
+    out = []
+    for ch in text:
+        if ch == "\n":
+            out.append("\n")
+        elif ch == "\t":
+            out.append(" ")
+        elif (ord(ch) > 0xFFFF or 0xFE00 <= ord(ch) <= 0xFE0F or ch == "\u200d"
+              or 0x2190 <= ord(ch) <= 0x2BFF):  # стрелки, тех. символы, фигуры, дингбаты
+            continue
+        elif unicodedata.category(ch) in _BAD_CATS:
+            continue
+        else:
+            out.append(ch)
+    text = "".join(out)
+    text = re.sub(r"[ \u00a0]+", " ", text)
+    text = "\n".join(line.strip() for line in text.split("\n"))  # переносы и пустые строки сохраняются
+    return text.strip()
+
+
+def has_words(text):
+    return any(ch.isalnum() for ch in text)
+
+
+def split_chunks(text, limit):
+    """Делит текст на куски по предложениям, чтобы модели не обрезали длинный текст."""
+    parts = re.split(r"(?<=[.!?…])\s+|\n+", text)
+    chunks, cur = [], ""
+    for part in parts:
+        part = part.strip()
+        while len(part) > limit:
+            cut = part.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(part[:cut].strip())
+            part = part[cut:].strip()
+        if not part:
+            continue
+        if cur and len(cur) + len(part) + 1 > limit:
+            chunks.append(cur)
+            cur = part
+        else:
+            cur = f"{cur} {part}".strip()
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if has_words(c)]
 
 
 class Engine:
@@ -38,22 +100,25 @@ class Engine:
         self.mt = {}
         self.tts = {}
 
-    def load(self):
-        self.log(f"Загрузка Whisper ({WHISPER_MODEL}) на {DEVICE}…")
+    def load(self, stage):
+        """stage(сообщение, процент_начала, процент_конца) — для индикатора загрузки."""
+        stage(f"Загрузка распознавания речи Whisper ({WHISPER_MODEL}) на {DEVICE}…  (1/5)", 0, 55)
         self.asr = pipeline(
             "automatic-speech-recognition",
             model=WHISPER_MODEL,
             device=0 if DEVICE == "cuda" else -1,
             torch_dtype=DTYPE,
         )
-        for pair in ("ru-en", "en-ru"):
-            self.log(f"Загрузка переводчика {pair}…")
+        mt_stages = {"ru-en": (55, 68), "en-ru": (68, 81)}
+        for i, pair in enumerate(("ru-en", "en-ru"), start=2):
+            stage(f"Загрузка переводчика {pair}…  ({i}/5)", *mt_stages[pair])
             name = f"Helsinki-NLP/opus-mt-{pair}"
             tok = MarianTokenizer.from_pretrained(name)
             model = MarianMTModel.from_pretrained(name).to(DEVICE, dtype=DTYPE).eval()
             self.mt[pair] = (tok, model)
-        for code, cfg in LANGS.items():
-            self.log(f"Загрузка голоса ({code})…")
+        tts_stages = {"ru": (81, 91), "en": (91, 100)}
+        for i, (code, cfg) in enumerate(LANGS.items(), start=4):
+            stage(f"Загрузка голоса ({code})…  ({i}/5)", *tts_stages[code])
             res = torch.hub.load(
                 "snakers4/silero-models", "silero_tts",
                 language=cfg["tts_lang"], speaker=cfg["tts_model"], trust_repo=True,
@@ -61,7 +126,6 @@ class Engine:
             model = res[0] if isinstance(res, tuple) else res
             model.to("cpu")
             self.tts[code] = model
-        self.log("Готово. Нажмите кнопку записи.")
 
     def transcribe(self, audio, lang):
         out = self.asr(
@@ -71,18 +135,51 @@ class Engine:
         return out["text"].strip()
 
     def translate(self, text, src, dst):
+        """Переводит построчно: переносы строк и пустые строки сохраняются."""
+        text = clean_text(text)
+        if not has_words(text):
+            raise ValueError("В тексте нет слов для перевода.")
         tok, model = self.mt[f"{src}-{dst}"]
-        inputs = tok(text, return_tensors="pt", truncation=True, max_length=512).to(DEVICE)
-        with torch.no_grad():
-            out = model.generate(**inputs, num_beams=4, max_new_tokens=256)
-        return tok.decode(out[0], skip_special_tokens=True)
+        out_lines = []
+        for line in text.split("\n"):
+            if not has_words(line):          # пустая строка (или только знаки, напр. «---») — оставляем как есть
+                out_lines.append(line)
+                continue
+            parts = []
+            for chunk in split_chunks(line, 400):
+                inputs = tok(chunk, return_tensors="pt", truncation=True, max_length=512).to(DEVICE)
+                with torch.no_grad():
+                    out = model.generate(**inputs, num_beams=4, max_new_tokens=400)
+                parts.append(tok.decode(out[0], skip_special_tokens=True))
+            out_lines.append(" ".join(parts))
+        return "\n".join(out_lines).strip()
+
+    def _tts_chunk(self, chunk, lang):
+        cfg = LANGS[lang]
+        try:
+            return self.tts[lang].apply_tts(text=chunk, speaker=cfg["speaker"], sample_rate=TTS_SR)
+        except Exception:
+            # запасной вариант: оставляем только буквы нужного языка, цифры и знаки препинания
+            if lang == "ru":
+                strict = re.sub(r"[^А-Яа-яЁё0-9\s.,!?:;\-—()%]", " ", chunk)
+            else:
+                strict = re.sub(r"[^A-Za-z0-9\s.,!?:;\-()%']", " ", chunk)
+            strict = re.sub(r"\s+", " ", strict).strip()
+            if not has_words(strict):
+                return None
+            return self.tts[lang].apply_tts(text=strict, speaker=cfg["speaker"], sample_rate=TTS_SR)
 
     def speak(self, text, lang):
-        cfg = LANGS[lang]
-        audio = self.tts[lang].apply_tts(
-            text=text, speaker=cfg["speaker"], sample_rate=TTS_SR
-        )
-        sd.play(audio.numpy(), TTS_SR)
+        chunks = split_chunks(clean_text(text), 250)
+        pieces = []
+        pause = torch.zeros(int(TTS_SR * 0.15))
+        for chunk in chunks:
+            audio = self._tts_chunk(chunk, lang)
+            if audio is not None:
+                pieces.extend([audio, pause])
+        if not pieces:
+            raise ValueError("В тексте нет слов для озвучки.")
+        sd.play(torch.cat(pieces).numpy(), TTS_SR)
         sd.wait()
 
 
@@ -94,7 +191,7 @@ class App:
         root.columnconfigure((0, 1), weight=1)
         root.rowconfigure(0, weight=1)
 
-        self.texts, self.buttons, self.tbuttons = {}, {}, {}
+        self.texts, self.buttons, self.tbuttons, self.sbuttons = {}, {}, {}, {}
         for col, (code, title, btn) in enumerate(
             [("ru", "Русский", "🎤 Запись (Русский)"), ("en", "English", "🎤 Record (English)")]
         ):
@@ -107,25 +204,45 @@ class App:
             self.enable_clipboard(t)
             row = ttk.Frame(frame)
             row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-            row.columnconfigure((0, 1), weight=1)
+            row.columnconfigure((0, 1, 2), weight=1)
             b = ttk.Button(row, text=btn, command=lambda c=code: self.toggle(c))
             b.grid(row=0, column=0, sticky="ew", padx=(0, 4))
             tb = ttk.Button(row, text="Перевести", command=lambda c=code: self.translate_text(c))
-            tb.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-            b.state(["disabled"])
-            tb.state(["disabled"])
+            tb.grid(row=0, column=1, sticky="ew", padx=4)
+            sb = ttk.Button(row, text="🔊 Озвучить", command=lambda c=code: self.speak_text(c))
+            sb.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+            for x in (b, tb, sb):
+                x.state(["disabled"])
             self.texts[code], self.buttons[code], self.tbuttons[code] = t, b, tb
+            self.sbuttons[code] = sb
 
         self.status = tk.StringVar(value="Запуск…")
-        ttk.Label(root, textvariable=self.status).grid(
-            row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 8)
-        )
+        self.pct_var = tk.StringVar(value="0%")
+        bar = ttk.Frame(root)
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 4))
+        bar.columnconfigure(1, weight=1)
+        self.spin_lbl = ttk.Label(bar, text="", width=2, font=("Segoe UI Symbol", 16))
+        self.spin_lbl.grid(row=0, column=0)
+        ttk.Label(bar, textvariable=self.status).grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Label(bar, textvariable=self.pct_var).grid(row=0, column=2, sticky="e")
+        self.progress = ttk.Progressbar(root, mode="determinate", maximum=100)
+        self.progress.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
+
+        # состояние загрузки / занятости
+        self.loading = True
+        self.busy = True
+        self.spin_i = 0
+        self.p_shown = 0.0
+        self.p_next = 0
+        for t in self.texts.values():       # пока модели грузятся, поля недоступны
+            t.config(state="disabled")
 
         self.labels = {"ru": "🎤 Запись (Русский)", "en": "🎤 Record (English)"}
         self.recording = None
         self.frames = []
         self.stream = None
         self.engine = Engine(self.set_status)
+        self.tick()
         threading.Thread(target=self._load, daemon=True).start()
 
     # ---------- вспомогательное ----------
@@ -144,16 +261,52 @@ class App:
 
     def set_buttons(self, enabled):
         def f():
-            for b in list(self.buttons.values()) + list(self.tbuttons.values()):
+            self.busy = not enabled
+            for b in (list(self.buttons.values()) + list(self.tbuttons.values())
+                      + list(self.sbuttons.values())):
                 b.state(["!disabled"] if enabled else ["disabled"])
         self.ui(f)
 
+    def stage(self, msg, start, end):
+        def f():
+            self.status.set(msg)
+            self.p_shown = max(self.p_shown, start)
+            self.p_next = end
+        self.ui(f)
+
+    def tick(self):
+        """Крутилка и плавное движение полосы загрузки."""
+        self.spin_lbl.config(text=SPINNER[self.spin_i % len(SPINNER)] if self.busy else "")
+        self.spin_i += 1
+        if self.loading:
+            cap = self.p_next - 1 if self.p_next < 100 else 100
+            if self.p_shown < cap:
+                self.p_shown += (cap - self.p_shown) * 0.02
+            self.progress["value"] = self.p_shown
+            self.pct_var.set(f"{int(self.p_shown)}%")
+        self.root.after(90, self.tick)
+
     def _load(self):
         try:
-            self.engine.load()
-            self.set_buttons(True)
+            self.engine.load(self.stage)
+            self.ui(self._loaded)
         except Exception as e:
-            self.set_status(f"Ошибка загрузки моделей: {e}")
+            def fail():
+                self.loading = False
+                self.busy = False
+                self.pct_var.set("ошибка")
+                self.status.set(f"Ошибка загрузки моделей: {e}")
+            self.ui(fail)
+
+    def _loaded(self):
+        self.loading = False
+        self.progress["value"] = 100
+        self.progress.grid_remove()
+        self.pct_var.set("")
+        for t in self.texts.values():
+            t.config(state="normal")
+        self.status.set("Готово. Нажмите кнопку записи.")
+        self.set_buttons(True)
 
     # ---------- буфер обмена (работает в любой раскладке) ----------
     def enable_clipboard(self, w):
@@ -200,6 +353,25 @@ class App:
         finally:
             self.set_buttons(True)
 
+    # ---------- озвучка текста из поля ----------
+    def speak_text(self, code):
+        text = self.texts[code].get("1.0", "end").strip()
+        if not text:
+            self.status.set("Поле пустое: нечего озвучивать.")
+            return
+        self.set_buttons(False)
+        threading.Thread(target=self.speak_pipeline, args=(code, text), daemon=True).start()
+
+    def speak_pipeline(self, code, text):
+        try:
+            self.set_status("Озвучиваю…")
+            self.engine.speak(text, code)
+            self.set_status("Готово.")
+        except Exception as e:
+            self.set_status(f"Ошибка: {e}")
+        finally:
+            self.set_buttons(True)
+
     # ---------- запись ----------
     def toggle(self, code):
         if self.recording is None:
@@ -212,7 +384,7 @@ class App:
         self.frames = []
         other = "en" if code == "ru" else "ru"
         self.buttons[other].state(["disabled"])
-        for tb in self.tbuttons.values():
+        for tb in list(self.tbuttons.values()) + list(self.sbuttons.values()):
             tb.state(["disabled"])
         self.buttons[code].config(text="⏹ Стоп")
         self.status.set("Слушаю… нажмите «Стоп», когда закончите.")
